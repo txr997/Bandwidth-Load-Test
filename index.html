@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Bandwidth Load Test</title>
   <style>
 
@@ -16,14 +17,15 @@
       color: #eee;
       text-align: center;
       padding: 2rem;
+      min-height: 100vh;
       position: relative;
-      height: 100vh;
     }
 
     .container {
       max-width: 900px;
       margin-right: auto;
       margin-left: auto;
+      padding-bottom: 80px;
     }
     .title {
       color: #00ffcc;
@@ -32,6 +34,60 @@
     .disc {
       margin-bottom: 20px;
     }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+      align-items: flex-end;
+      margin-bottom: 20px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      font-size: 0.8rem;
+      opacity: 0.85;
+    }
+    .field input {
+      background: #222;
+      color: #eee;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 0.45rem 0.5rem;
+      font-size: 0.9rem;
+      margin: 0;
+    }
+    .field input.url { width: 340px; max-width: 100%; }
+    .field input.num { width: 90px; }
+
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+    }
+    .stat {
+      background: #1b1b1b;
+      border: 1px solid #262626;
+      border-radius: 8px;
+      padding: 10px 18px;
+      min-width: 130px;
+      margin: 0;
+    }
+    .stat b {
+      display: block;
+      font-size: 1.4rem;
+      color: #00ffcc;
+      line-height: 1.4;
+    }
+    .stat span {
+      font-size: 0.75rem;
+      opacity: 0.7;
+    }
+
     .log {
       margin-top: 1rem;
       font-size: 0.9rem;
@@ -43,6 +99,9 @@
       border-radius: 8px;
       text-align: left;
     }
+    .log .err { color: #ff6b6b; }
+    .log .ok { color: #00ffcc; }
+
     button {
       padding: 0.5rem 1rem;
       font-size: 1rem;
@@ -51,10 +110,18 @@
       border: none;
       border-radius: 5px;
       cursor: pointer;
+      margin: 0;
     }
     button:hover {
       background: #00ddb3;
     }
+    button:disabled {
+      background: #444;
+      color: #888;
+      cursor: not-allowed;
+    }
+    button.stop { background: #ff6b6b; }
+    button.stop:hover { background: #e05555; }
 
     .author {
         position: absolute;
@@ -78,7 +145,31 @@
   <div class="container">
     <h1 class="title">🚀 Bandwidth Load Test</h1>
     <p class="disc">This tool downloads large files repeatedly to simulate high Mbps usage.</p>
-    <button onclick="startTest()">Start Load Test</button>
+
+    <div class="controls">
+      <label class="field">
+        Download URL (host must allow CORS)
+        <input class="url" id="url" value="https://speed.cloudflare.com/__down?bytes=52428800" />
+      </label>
+      <label class="field">
+        Parallel connections
+        <input class="num" id="conns" type="number" min="1" max="32" value="4" />
+      </label>
+      <label class="field">
+        Downloads (0 = until stopped)
+        <input class="num" id="count" type="number" min="0" max="1000" value="10" />
+      </label>
+      <button id="startBtn" onclick="startTest()">Start Load Test</button>
+      <button id="stopBtn" class="stop" onclick="stopTest()" disabled>Stop</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="sLive">0.00</b><span>Live Mbps</span></div>
+      <div class="stat"><b id="sAvg">0.00</b><span>Average Mbps</span></div>
+      <div class="stat"><b id="sData">0.00</b><span>Total MB</span></div>
+      <div class="stat"><b id="sDone">0</b><span>Completed</span></div>
+    </div>
+
     <div class="log" id="log"></div>
   </div>
 
@@ -86,30 +177,149 @@
 
 
   <script>
-    const url = "https://cors.isomorphic-git.org/https://download.thinkbroadband.com/50MB.zip";
-    const repeatCount = 10;
     const log = document.getElementById("log");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
 
-    function logMessage(msg) {
+    let running = false;
+    let controller = null;
+    let totalBytes = 0;
+    let completed = 0;
+    let started = 0;
+    let startTime = 0;
+    let tickTimer = null;
+    let lastBytes = 0;
+    let lastTick = 0;
+
+    function logMessage(msg, cls) {
       const time = new Date().toLocaleTimeString();
-      log.innerHTML += `[${time}] ${msg}<br>`;
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = "[" + time + "] " + msg;
+      log.appendChild(line);
       log.scrollTop = log.scrollHeight;
     }
 
-    async function startTest() {
-      log.innerHTML = "";
-      logMessage("Starting bandwidth load test...");
-      for (let i = 0; i < repeatCount; i++) {
+    // Cache-buster so neither the browser nor a CDN serves the same bytes twice.
+    function bustCache(raw) {
+      const u = new URL(raw, location.href);
+      u.searchParams.set("_cb", Date.now().toString(36) + Math.random().toString(36).slice(2));
+      return u.toString();
+    }
+
+    function updateStats() {
+      const now = performance.now();
+      const elapsed = (now - startTime) / 1000;
+      const deltaBits = (totalBytes - lastBytes) * 8;
+      const deltaSecs = (now - lastTick) / 1000;
+      lastBytes = totalBytes;
+      lastTick = now;
+
+      document.getElementById("sLive").textContent =
+        deltaSecs > 0 ? (deltaBits / deltaSecs / 1e6).toFixed(2) : "0.00";
+      document.getElementById("sAvg").textContent =
+        elapsed > 0 ? (totalBytes * 8 / elapsed / 1e6).toFixed(2) : "0.00";
+      document.getElementById("sData").textContent = (totalBytes / (1024 * 1024)).toFixed(2);
+      document.getElementById("sDone").textContent = String(completed);
+    }
+
+    function describe(err) {
+      if (err instanceof TypeError) {
+        return err.message + " - blocked by CORS or the host is unreachable. Use a URL that " +
+               "sends Access-Control-Allow-Origin, e.g. speed.cloudflare.com/__down?bytes=52428800";
+      }
+      return err.message;
+    }
+
+    async function downloadOnce(index, rawUrl) {
+      const t0 = performance.now();
+      const res = await fetch(bustCache(rawUrl), { cache: "no-store", signal: controller.signal });
+      if (!res.ok) throw new Error("HTTP " + res.status + " " + res.statusText);
+
+      let bytes = 0;
+      if (res.body && res.body.getReader) {
+        // Stream it, so bandwidth is measured while it flows instead of only at the end.
+        const reader = res.body.getReader();
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          bytes += chunk.value.byteLength;
+          totalBytes += chunk.value.byteLength;
+          if (!running) { await reader.cancel(); break; }
+        }
+      } else {
+        const blob = await res.blob();
+        bytes = blob.size;
+        totalBytes += bytes;
+      }
+
+      const secs = (performance.now() - t0) / 1000;
+      const mb = bytes / (1024 * 1024);
+      const mbps = secs > 0 ? (bytes * 8 / secs / 1e6) : 0;
+      logMessage("Download " + index + ": " + mb.toFixed(2) + " MB in " +
+                 secs.toFixed(1) + "s (" + mbps.toFixed(2) + " Mbps)");
+    }
+
+    async function worker(rawUrl, limit) {
+      while (running && (limit === 0 || started < limit)) {
+        const index = ++started;
         try {
-          const res = await fetch(url);
-          const blob = await res.blob();
-          const sizeMB = (blob.size / (1024 * 1024)).toFixed(2);
-          logMessage(`Download ${i + 1}: ${sizeMB} MB`);
+          await downloadOnce(index, rawUrl);
+          completed++;
         } catch (err) {
-          logMessage(`Download ${i + 1} failed: ${err.message}`);
+          if (err.name === "AbortError") return;
+          logMessage("Download " + index + " failed: " + describe(err), "err");
+          // A hard failure (CORS/DNS) returns instantly - pause so the loop cannot spin.
+          await new Promise(r => setTimeout(r, 1000));
         }
       }
-      logMessage("✅ Test complete.");
+    }
+
+    function setRunning(state) {
+      running = state;
+      startBtn.disabled = state;
+      stopBtn.disabled = !state;
+    }
+
+    function stopTest() {
+      if (!running) return;
+      running = false;
+      if (controller) controller.abort();
+    }
+
+    async function startTest() {
+      if (running) return;
+
+      const rawUrl = document.getElementById("url").value.trim();
+      if (!rawUrl) { logMessage("Please enter a download URL.", "err"); return; }
+
+      const conns = Math.max(1, Math.min(32, parseInt(document.getElementById("conns").value, 10) || 1));
+      const limit = Math.max(0, parseInt(document.getElementById("count").value, 10) || 0);
+
+      log.innerHTML = "";
+      totalBytes = 0; completed = 0; started = 0; lastBytes = 0;
+      startTime = lastTick = performance.now();
+      controller = new AbortController();
+      setRunning(true);
+
+      logMessage("Starting bandwidth load test - " + conns + " parallel connection(s), " +
+                 (limit === 0 ? "unlimited" : limit) + " download(s).");
+
+      tickTimer = setInterval(updateStats, 500);
+
+      const workers = [];
+      for (let i = 0; i < conns; i++) workers.push(worker(rawUrl, limit));
+      await Promise.all(workers);
+
+      clearInterval(tickTimer);
+      setRunning(false);
+      updateStats();
+      document.getElementById("sLive").textContent = "0.00";
+
+      const elapsed = (performance.now() - startTime) / 1000;
+      logMessage("✅ Test complete - " + completed + " download(s), " +
+                 (totalBytes / (1024 * 1024)).toFixed(2) + " MB in " + elapsed.toFixed(1) + "s (avg " +
+                 (totalBytes * 8 / elapsed / 1e6).toFixed(2) + " Mbps).", "ok");
     }
   </script>
 </body>
